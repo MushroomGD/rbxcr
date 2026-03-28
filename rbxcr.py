@@ -27,7 +27,7 @@ TARGET_CURSORS = ['ArrowCursor.png', 'ArrowFarCursor.png', 'IBeamCursor.png']
 class CursorChangerApp:
     def __init__(self, root, launch_file=None, start_minimized=False):
         self.root = root
-        self.root.title("Roblox Cursor Manager Pro")
+        self.root.title("Roblox Cursor Replacer")
         self.root.geometry("600x850")
         
         icon_p = resource_path("icon.ico")
