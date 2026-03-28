@@ -5,8 +5,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 from PIL import Image, ImageTk
 import json
-import uuid
-import zipfile
+import time
+import threading
 import winreg as reg
 
 def resource_path(relative_path):
@@ -16,20 +16,20 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-# Configuration
+# configs
 LOCAL_APP_DATA = os.environ.get('LOCALAPPDATA')
 BASE_DIR = os.path.join(LOCAL_APP_DATA, 'rbxcr')
 PRESETS_DIR = os.path.join(BASE_DIR, 'presets') 
+CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
 
 TARGET_CURSORS = ['ArrowCursor.png', 'ArrowFarCursor.png', 'IBeamCursor.png']
 
 class CursorChangerApp:
-    def __init__(self, root, launch_file=None):
+    def __init__(self, root, launch_file=None, start_minimized=False):
         self.root = root
-        self.root.title("Roblox Cursor Manager - felfel")
+        self.root.title("Roblox Cursor Manager Pro")
         self.root.geometry("600x850")
         
-        # Set window icon (if icon.ico is bundled)
         icon_p = resource_path("icon.ico")
         if os.path.exists(icon_p):
             self.root.iconbitmap(icon_p)
@@ -41,68 +41,85 @@ class CursorChangerApp:
         if not os.path.exists(PRESETS_DIR):
             os.makedirs(PRESETS_DIR)
         
-        self._setup_file_association()
+        self._setup_system_configs()
         self._unpack_bundled_presets()
         self._create_widgets()
         self._find_newest_roblox_path()
         self._load_current_roblox_previews()
         self._refresh_preset_menu()
 
-        if launch_file and launch_file.lower().endswith(".rbxcrp"):
-            self._handle_external_import(launch_file)
+        # start background watcher thread
+        self.watcher_thread = threading.Thread(target=self._version_watcher, daemon=True)
+        self.watcher_thread.start()
 
-    def _setup_file_association(self):
-        """Registers .rbxcrp files to open with this EXE and uses the icon."""
-        if not getattr(sys, 'frozen', False):
-            return 
+        if launch_file:
+            self._handle_external_import(launch_file)
+        
+        if start_minimized:
+            self.root.withdraw()
+
+    def _setup_system_configs(self):
+        """Sets up Startup Registry and File Association."""
+        if not getattr(sys, 'frozen', False): return 
 
         exe_path = sys.executable
-        icon_path = f'"{exe_path}",0' # Index 0 is the main icon of the EXE
-
         try:
-            # 1. Associate .rbxcrp with a ProgID
+            # associate with rbxcrp files
             with reg.CreateKey(reg.HKEY_CURRENT_USER, r"Software\Classes\.rbxcrp") as key:
                 reg.SetValue(key, "", reg.REG_SZ, "RobloxCursorPreset")
-
-            # 2. Define the ProgID
-            prog_id_path = r"Software\Classes\RobloxCursorPreset"
-            with reg.CreateKey(reg.HKEY_CURRENT_USER, prog_id_path) as key:
-                reg.SetValue(key, "", reg.REG_SZ, "Roblox Cursor Preset File")
-
-            # 3. Set the Icon for the file type
-            with reg.CreateKey(reg.HKEY_CURRENT_USER, f"{prog_id_path}\\DefaultIcon") as key:
-                reg.SetValue(key, "", reg.REG_SZ, icon_path)
-
-            # 4. Set the Open Command
-            with reg.CreateKey(reg.HKEY_CURRENT_USER, f"{prog_id_path}\\shell\\open\\command") as key:
+            with reg.CreateKey(reg.HKEY_CURRENT_USER, r"Software\Classes\RobloxCursorPreset\DefaultIcon") as key:
+                reg.SetValue(key, "", reg.REG_SZ, f'"{exe_path}",0')
+            with reg.CreateKey(reg.HKEY_CURRENT_USER, r"Software\Classes\RobloxCursorPreset\shell\open\command") as key:
                 reg.SetValue(key, "", reg.REG_SZ, f'"{exe_path}" "%1"')
-                
+
+            # start watcher on startup
+            with reg.CreateKey(reg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
+                reg.SetValueEx(key, "RBXCursorManager", 0, reg.REG_SZ, f'"{exe_path}" --silent')
         except Exception as e:
             print(f"Registry error: {e}")
 
-    def _handle_external_import(self, path):
-        dest = os.path.join(PRESETS_DIR, os.path.basename(path))
-        if not os.path.exists(dest):
-            shutil.copy2(path, dest)
-        self._refresh_preset_menu()
-        self.preset_var.set(os.path.basename(path))
-        self._on_preset_selected(os.path.basename(path))
-        messagebox.showinfo("Imported", f"Preset '{os.path.basename(path)}' imported!")
+    def _version_watcher(self):
+        """Lightweight loop to check for Roblox updates every 60 seconds."""
+        last_version = None
+        while True:
+            self._find_newest_roblox_path()
+            current_version = self.roblox_cursor_path
+            
+            # if the path changed, auto-apply
+            if last_version and current_version != last_version:
+                self._apply_changes(silent=True)
+            
+            last_version = current_version
+            time.sleep(60)
 
-    def _unpack_bundled_presets(self):
-        bundled_presets = ["2006-2013.rbxcrp", "2013-2021.rbxcrp", "2021.rbxcrp"]
-        for p_name in bundled_presets:
-            internal_path = resource_path(p_name)
-            external_path = os.path.join(PRESETS_DIR, p_name)
-            if os.path.exists(internal_path) and not os.path.exists(external_path):
-                shutil.copy2(internal_path, external_path)
+    def _apply_changes(self, silent=False):
+        if not self.roblox_cursor_path: return
+        
+        success = True
+        try:
+            for name, src in self.selected_files.items():
+                if src and os.path.exists(src):
+                    dest = os.path.join(self.roblox_cursor_path, name)
+                    if self.resize_var.get():
+                        with Image.open(src) as img:
+                            img.resize((64, 64), Image.Resampling.LANCZOS).save(dest, "PNG")
+                    else:
+                        shutil.copy2(src, dest)
+        except:
+            success = False
+
+        if not silent:
+            if success: messagebox.showinfo("Done", "Cursors Applied!")
+            else: messagebox.showerror("Error", "Could not apply cursors.")
+
+    
 
     def _create_widgets(self):
         tk.Label(self.root, text="Roblox Cursor Customizer", font=("Segoe UI", 16, "bold")).pack(pady=10)
+        tk.Button(self.root, text="Hide to Background", command=self.root.withdraw).pack(pady=5)
         
         self.main_frame = tk.Frame(self.root)
         self.main_frame.pack(pady=5, padx=20, fill=tk.X)
-
         for name in TARGET_CURSORS:
             frame = tk.LabelFrame(self.main_frame, text=f" {name} ", padx=10, pady=5)
             frame.pack(pady=5, fill=tk.X)
@@ -112,23 +129,21 @@ class CursorChangerApp:
 
         settings_frame = tk.LabelFrame(self.root, text=" Settings ", padx=10, pady=10)
         settings_frame.pack(pady=15, padx=20, fill=tk.X)
-
         self.resize_var = tk.BooleanVar(value=True)
         tk.Checkbutton(settings_frame, text="Force Resize to 64x64 (f64)", variable=self.resize_var).pack(anchor="w")
 
         preset_frame = tk.LabelFrame(self.root, text=" Presets (.rbxcrp) ", padx=10, pady=10)
         preset_frame.pack(pady=10, padx=20, fill=tk.X)
-
         self.preset_var = tk.StringVar(value="Select Preset")
         self.preset_menu = tk.OptionMenu(preset_frame, self.preset_var, "Default", command=self._on_preset_selected)
         self.preset_menu.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-
         tk.Button(preset_frame, text="Save As", command=self._export_preset).pack(side=tk.LEFT, padx=2)
         tk.Button(preset_frame, text="Import", command=self._import_preset).pack(side=tk.LEFT, padx=2)
 
         tk.Button(self.root, text="APPLY TO ROBLOX", bg="#28a745", fg="white", 
                   font=("Segoe UI", 12, "bold"), height=2, command=self._apply_changes).pack(pady=20, fill=tk.X, padx=40)
 
+    
     def _find_newest_roblox_path(self):
         if not LOCAL_APP_DATA: return
         v_dir = os.path.join(LOCAL_APP_DATA, 'Roblox', 'Versions')
@@ -173,7 +188,7 @@ class CursorChangerApp:
         self._refresh_preset_menu()
 
     def _import_preset(self):
-        path = filedialog.askopenfilename(filetypes=[("RBXCR Preset", "*.rbxcrp")])
+        path = filedialog.askopenfilename(filetotal=[("RBXCR Preset", "*.rbxcrp")])
         if path:
             shutil.copy2(path, os.path.join(PRESETS_DIR, os.path.basename(path)))
             self._refresh_preset_menu()
@@ -186,6 +201,7 @@ class CursorChangerApp:
         temp_extract = os.path.join(BASE_DIR, "temp_extract")
         if os.path.exists(temp_extract): shutil.rmtree(temp_extract)
         os.makedirs(temp_extract)
+        import zipfile
         with zipfile.ZipFile(preset_path, 'r') as zipf:
             zipf.extractall(temp_extract)
             meta_path = os.path.join(temp_extract, 'metadata.json')
@@ -210,21 +226,19 @@ class CursorChangerApp:
                 self._update_preview(name, Image.open(p))
                 self.selected_files[name] = p
 
-    def _apply_changes(self):
-        if not self.roblox_cursor_path: return
-        if messagebox.askyesno("Confirm", "Apply to Roblox?"):
-            for name, src in self.selected_files.items():
-                if src:
-                    dest = os.path.join(self.roblox_cursor_path, name)
-                    if self.resize_var.get():
-                        with Image.open(src) as img:
-                            img.resize((64, 64), Image.Resampling.LANCZOS).save(dest, "PNG")
-                    else:
-                        shutil.copy2(src, dest)
-            messagebox.showinfo("Done", "Updated!")
+    def _unpack_bundled_presets(self):
+        bundled_presets = ["2006-2013.rbxcrp", "2013-2021.rbxcrp"]
+        for p_name in bundled_presets:
+            internal_path = resource_path(p_name)
+            external_path = os.path.join(PRESETS_DIR, p_name)
+            if os.path.exists(internal_path) and not os.path.exists(external_path):
+                shutil.copy2(internal_path, external_path)
 
 if __name__ == "__main__":
-    launch_file = sys.argv[1] if len(sys.argv) > 1 else None
+    args = sys.argv[1:]
+    silent = "--silent" in args
+    launch_file = next((a for a in args if a.endswith(".rbxcrp")), None)
+    
     root = tk.Tk()
-    app = CursorChangerApp(root, launch_file=launch_file)
+    app = CursorChangerApp(root, launch_file=launch_file, start_minimized=silent)
     root.mainloop()
